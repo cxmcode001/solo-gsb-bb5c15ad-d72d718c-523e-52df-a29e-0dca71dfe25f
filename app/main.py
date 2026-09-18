@@ -23,7 +23,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Dependency-Aware Task Lease API",
-    version="1.0.0",
+    version="1.1.0",
     description="提交 DAG、原子领取前置已完成的任务、基于租约令牌回报结果。",
     lifespan=lifespan,
 )
@@ -97,3 +97,23 @@ def complete_task(task_id: str, body: CompleteIn):
             media_type="application/json",
         )
     return result
+
+
+@app.post(
+    "/tasks/{task_id}/resume",
+    summary="恢复最终失败的任务",
+    description=(
+        "仅允许 state=failed 的任务：在单个事务内将其置回 pending、清除租约与完成时间、"
+        "追加 task.resumed 事件，并按依赖图递归检查被阻塞的后继——全部直接前置均已 "
+        "succeeded 或处于 pending 状态的后继解锁为 pending（task.unblocked 事件），"
+        "否则保留 blocked 与原阻塞原因。任务不处于 failed 状态（含重复恢复）返回 409，"
+        "不新增事件。"
+    ),
+    responses={
+        200: {"description": "恢复成功：任务已回到 pending，返回本次解锁的后继数"},
+        404: {"description": "任务不存在（task_not_found）"},
+        409: {"description": "任务不是最终失败状态，含重复恢复（task_not_failed）"},
+    },
+)
+def resume_task(task_id: str) -> dict:
+    return service.resume_task(task_id)

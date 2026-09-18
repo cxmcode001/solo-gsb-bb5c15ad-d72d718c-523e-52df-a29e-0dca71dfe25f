@@ -26,7 +26,8 @@ DAG，工作器原子领取「所有前置均已成功」的任务，凭借唯�
   （`success=false`）才原子递增独立的 `failure_count` 并消耗重试预算；租约过期后
   被重新领取只增加 `attempt`，不影响失败计数。失败后回到 `pending` 等待下一次领取；
   `failure_count` 达到上限后置为 `failed`，并递归阻塞所有直接/间接后继
-  （状态 `blocked`，带 `blocked_reason`），后继永远无法被领取。
+  （状态 `blocked`，带 `blocked_reason`），后继再也无法被领取——除非通过
+  `POST /tasks/{task_id}/resume` 恢复失败任务（见下）。
 - **持久化指数退避**：任务可在提交时配置 `retry_backoff`：
   `{"initial_seconds": >0, "multiplier": >=1, "max_seconds": >= initial_seconds}`，
   随任务持久化（`max_seconds < initial_seconds` 等非法组合在提交时 422 拒绝）。
@@ -41,6 +42,15 @@ DAG，工作器原子领取「所有前置均已成功」的任务，凭借唯�
   `GET /dags/{id}`）返回持久化的 `retry_backoff` 策略与当前 `next_eligible_at`；
   `task.requeued` 事件携带 `next_eligible_at`（其他事件该字段为 `null`）。
   策略与下次可领时刻均持久化在 SQLite 中，服务重启后仍然有效。
+- **失败恢复**：最终失败（`failed`）的任务可通过 `POST /tasks/{task_id}/resume`
+  人工恢复：在单个事务内将任务置回 `pending`、清除租约与完成时间
+  （`finished_at`）并追加 `task.resumed` 事件，随后按依赖图递归检查被阻塞的
+  后继——某后继的**全部直接前置**均已 `succeeded` 或处于 `pending` 状态
+  （含本次恢复中刚解锁的后继，沿拓扑序传播）时解锁为 `pending`
+  （追加 `task.unblocked` 事件、清除 `blocked_reason`）；否则保留 `blocked`
+  与原阻塞原因。恢复不重置 `failure_count` 与剩余重试预算。仅 `failed`
+  状态可恢复：其他状态（含恢复成功后的重复调用）返回 `409 task_not_failed`，
+  且不新增任何事件。
 - **幂等回报**：回报接口必须携带客户端生成的 `completion_id`。相同
   `task_id + completion_id` 且 `lease_token`、`success`、`result`、`error`
   等价的请求只生效一次——即使任务此后已被重新领取，重放也逐字节返回首次响应
@@ -52,7 +62,8 @@ DAG，工作器原子领取「所有前置均已成功」的任务，凭借唯�
 - **持久化事件流**：所有关键状态变迁都在**同一事务**内向只增（append-only）的事件流
   追加一条不可变事件——`dag.created`（DAG 创建）以及
   `task.claimed`（领取/过期重领）、`task.requeued`（失败重排）、
-  `task.succeeded`（成功）、`task.failed`（最终失败）、`task.blocked`（后继被阻塞）。
+  `task.succeeded`（成功）、`task.failed`（最终失败）、`task.blocked`（后继被阻塞）、
+  `task.resumed`（失败恢复）、`task.unblocked`（恢复时后继解锁）。
   事件与业务变更同生共死：事务回滚（如图校验之后的插入冲突）不留任何事件；
   幂等重放与 4xx 错误路径不产生事件。事件含全局严格递增的 `sequence`、`dag_id`、
   可空的 `task_id`/`attempt`/`from_state`/`to_state` 与 `occurred_at`
@@ -300,7 +311,41 @@ curl -s http://localhost:8000/tasks/<TASK_ID> | jq '{state, retry_backoff, next_
 > 租约过期后旧令牌**首次**使用新 `completion_id` 的回报返回 **409**，
 > 不会作用于已开始的新尝试；只有曾成功生效过的幂等键才会回放首次响应。
 
-### 5. 状态查询
+### 5. 恢复最终失败的任务
+
+重试耗尽进入 `failed` 的任务（连同被阻塞的后继）默认再也无法被领取。修复根因后，
+可凭任务 id 人工恢复——无需请求体：
+
+```bash
+curl -s -X POST http://localhost:8000/tasks/<TASK_ID>/resume
+```
+
+```json
+{
+  "task_id": "…", "state": "pending", "attempt": 3,
+  "failure_count": 3, "unblocked_descendants": 2
+}
+```
+
+- 仅 `failed` 状态可恢复：任务在**同一事务**内回到 `pending`、清除租约与
+  `finished_at`，并追加 `task.resumed` 事件，随后即可被正常领取
+  （下次领取 `attempt` 照常 +1）。恢复**不重置** `failure_count` 与剩余重试预算。
+- 被阻塞的后继按依赖图**递归**检查：全部直接前置均已 `succeeded` 或处于
+  `pending` 状态（含本次恢复中刚解锁的后继，沿拓扑序传播）时解锁为 `pending`
+  （追加 `task.unblocked` 事件、清除 `blocked_reason`）；仍有前置处于
+  `failed`/`blocked`/`running` 的后继保持 `blocked`，`blocked_reason` 原样保留。
+  响应中的 `unblocked_descendants` 为本次解锁的后继数。
+- 任务不是 `failed`（`pending`/`running`/`succeeded`/`blocked`，**含恢复成功后的
+  重复调用**）返回 `409 task_not_failed`，且不新增任何事件；
+  任务不存在返回 `404 task_not_found`。
+
+```bash
+# 重复恢复同一任务：409，事件流不新增事件
+curl -i -X POST http://localhost:8000/tasks/<TASK_ID>/resume
+# -> 409 {"error":{"code":"task_not_failed","details":{"state":"pending", ...}}}
+```
+
+### 6. 状态查询
 
 ```bash
 # DAG 概览（状态计数 + 任务列表，含阻塞原因）
@@ -339,7 +384,7 @@ curl -s 'http://localhost:8000/tasks?state=blocked'
 "next_eligible_at": "2026-09-18T11:00:02Z", "lease": null}`；
 未配置退避时 `retry_backoff` 与 `next_eligible_at` 均为 `null`。
 
-### 6. 事件流
+### 7. 事件流
 
 事件流只增不改，记录全部关键状态变迁。每条事件形如：
 
@@ -358,7 +403,8 @@ curl -s 'http://localhost:8000/tasks?state=blocked'
 ```
 
 - `type` ∈ `dag.created` / `task.claimed` / `task.requeued` /
-  `task.succeeded` / `task.failed` / `task.blocked`；
+  `task.succeeded` / `task.failed` / `task.blocked` / `task.resumed` /
+  `task.unblocked`；
 - `sequence` 为全局严格递增游标，事件按其升序返回；`dag.created` 事件的
   `task_id`、`attempt`、`from_state`、`to_state` 均为 `null`；
 - `next_eligible_at` 仅 `task.requeued` 携带：配置了 `retry_backoff` 时为退避后的
@@ -398,7 +444,7 @@ curl -s 'http://localhost:8000/events?after=0&limit=50'
 curl -s 'http://localhost:8000/events?dag_id=<DAG_ID>&after=0&limit=100'
 ```
 
-### 7. 只读分析（关键路径）
+### 8. 只读分析（关键路径）
 
 按任务声明的 `duration_seconds`（缺省 1）对整个 DAG 做关键路径分析，
 与任务当前运行状态无关，纯粹回答「如果现在开始，理想排程长什么样」：
@@ -446,6 +492,8 @@ curl -s http://localhost:8000/dags/<DAG_ID>/analysis | jq
 | 回报成功 | `task.succeeded` | `running` → `succeeded` |
 | 显式失败、重试耗尽 | `task.failed` | `running` → `failed` |
 | 递归阻塞后继 | `task.blocked` | 原状态（`pending`/`running`）→ `blocked` |
+| 恢复最终失败任务 | `task.resumed` | `failed` → `pending` |
+| 恢复时递归解锁后继 | `task.unblocked` | `blocked` → `pending` |
 
 ## API 一览
 
@@ -460,6 +508,7 @@ curl -s http://localhost:8000/dags/<DAG_ID>/analysis | jq
 | `GET` | `/tasks/{task_id}` | 任务详情：尝试历史、租约、阻塞原因 |
 | `POST` | `/tasks/{task_id}/heartbeat` | 凭当前租约令牌续租 |
 | `POST` | `/tasks/{task_id}/complete` | 凭租约令牌 + `completion_id` 幂等回报成功/失败 |
+| `POST` | `/tasks/{task_id}/resume` | 恢复最终失败的任务：置回 pending，递归解锁前置已全部 succeeded/pending 的被阻塞后继（重复恢复 409） |
 | `GET` | `/health` | 健康检查 |
 
 ## 任务状态机
@@ -468,11 +517,15 @@ curl -s http://localhost:8000/dags/<DAG_ID>/analysis | jq
 pending ──claim──▶ running ──complete(success)──────────▶ succeeded
   ▲                  │  │
   │ fail (可重试;    │  └─complete(fail, 重试耗尽)─▶ failed ──▶ blocked(所有后继)
-  │ retry_backoff    │
-  │ 到期才可重领)    │
-  └──────────────────┘
+  │ retry_backoff    │                                  │             │
+  │ 到期才可重领)    │                                  └─ resume ────┴─(前置全部
+  └──────────────────┘                                       已 succeeded/pending
                      └─租约过期─▶ 可被再次 claim（attempt+1，新令牌；旧令牌全部 409；不触发退避）
 ```
+
+`resume` 在单个事务内把 `failed` 任务置回 `pending`（清除租约与完成时间），
+并按依赖图递归把「全部直接前置均已 `succeeded`/`pending`」的 `blocked` 后继
+一并解锁回 `pending`；其余后继保持 `blocked` 与原阻塞原因。
 
 ## 开发与测试
 
@@ -494,4 +547,8 @@ attempt 递增与令牌唯一、过期后旧令牌 409、心跳续租、重试�
 键集分页无漏项/重复、dag_id 过滤、参数校验、重启后不重置、存储层不可变）、
 只读分析（最早/最晚时间与总时差、总工期、关键路径与关键任务集合、并行层级、
 默认与小数时长、并列关键路径的确定性、只读不产生事件、404/422 错误路径、
-旧库迁移后默认时长）。
+旧库迁移后默认时长）、
+失败恢复（仅 failed 可恢复且同事务置回 pending/清除租约与完成时间、task.resumed 与
+task.unblocked 事件及因果顺序、递归解锁链式后继、仍有失败前置时保留 blocked 与原阻塞原因、
+逐个恢复多个失败上游后最终解锁、不重置 failure_count 与重试预算、
+重复恢复与非 failed 各状态 409 且不新增事件、未知任务 404、OpenAPI 已登记）。

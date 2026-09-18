@@ -31,6 +31,8 @@ EVT_TASK_REQUEUED = "task.requeued"
 EVT_TASK_SUCCEEDED = "task.succeeded"
 EVT_TASK_FAILED = "task.failed"
 EVT_TASK_BLOCKED = "task.blocked"
+EVT_TASK_RESUMED = "task.resumed"
+EVT_TASK_UNBLOCKED = "task.unblocked"
 
 
 def _append_event(
@@ -751,6 +753,127 @@ def complete_task(task_id: str, body: dict[str, Any]) -> dict[str, Any] | Replay
             raise
 
     return response
+
+
+# ---------------------------------------------------------------- 失败恢复
+
+def _unblock_descendants(conn, dag_id: str, root_key: str, occurred_at: str) -> int:
+    """最终失败任务恢复为 pending 后，递归检查被阻塞的后继。
+
+    按拓扑序（堆按任务键字典序，保证多次调用判定与事件顺序一致）扫描 DAG：
+    某 blocked 任务的全部直接前置均已 succeeded、或处于 pending 状态
+    （含本次恢复中刚解锁的后继——沿拓扑序向下游传播）时，将其解锁为
+    pending 并追加 task.unblocked 事件；否则保留 blocked 与原
+    blocked_reason 不动。返回本次解锁的后继任务数。
+    """
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE dag_id = ?", (dag_id,)
+    ).fetchall()
+    by_key = {r["task_key"]: r for r in rows}
+    # 调用方已在同一事务内把 root_key 置为 pending，这里读到的是最新状态
+    states = {k: r["state"] for k, r in by_key.items()}
+    deps: dict[str, list[str]] = {k: [] for k in by_key}
+    succ: dict[str, list[str]] = {k: [] for k in by_key}
+    for r in conn.execute(
+        "SELECT task_key, dep_key FROM dependencies WHERE dag_id = ?", (dag_id,)
+    ).fetchall():
+        deps[r["task_key"]].append(r["dep_key"])
+        succ[r["dep_key"]].append(r["task_key"])
+
+    # 拓扑序（Kahn）：保证前置先于后继被判定，本波次解锁的后继可继续向下游传播
+    indeg = {k: len(deps[k]) for k in by_key}
+    heap = [k for k in by_key if indeg[k] == 0]
+    heapq.heapify(heap)
+    unblocked = 0
+    while heap:
+        key = heapq.heappop(heap)
+        if states[key] == BLOCKED and all(
+            states[p] in (SUCCEEDED, PENDING) for p in deps[key]
+        ):
+            row = by_key[key]
+            conn.execute(
+                """UPDATE tasks
+                   SET state = 'pending', blocked_reason = NULL,
+                       lease_token = NULL, lease_expires_at = NULL, worker_id = NULL,
+                       next_eligible_at = NULL
+                   WHERE id = ?""",
+                (row["id"],),
+            )
+            # task.unblocked 与解锁更新同事务，只记录实际发生的状态改变
+            _append_event(
+                conn,
+                EVT_TASK_UNBLOCKED,
+                dag_id,
+                occurred_at,
+                task_id=row["id"],
+                attempt=row["attempt"],
+                from_state=BLOCKED,
+                to_state=PENDING,
+            )
+            states[key] = PENDING
+            unblocked += 1
+        for nxt in succ[key]:
+            indeg[nxt] -= 1
+            if indeg[nxt] == 0:
+                heapq.heappush(heap, nxt)
+    return unblocked
+
+
+def resume_task(task_id: str) -> dict[str, Any]:
+    """恢复最终失败的任务：置回 pending 并递归解锁可满足的被阻塞后继。
+
+    仅 state=failed 的任务可恢复；其他状态（含恢复成功后的重复调用）
+    一律 409，回滚保证不追加任何事件。恢复不重置 failure_count 与重试预算。
+    """
+    now_iso = _iso(_now())
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise APIError(404, "task_not_found", f"任务 {task_id} 不存在")
+            if row["state"] != FAILED:
+                # 重复恢复（已回到 pending 或进入更后续状态）同样命中此分支：409 且无事件
+                raise APIError(
+                    409,
+                    "task_not_failed",
+                    "仅最终失败（failed）的任务可以恢复",
+                    {"task_id": task_id, "state": row["state"]},
+                )
+            # 置回 pending 并清除租约与完成时间，立即可被重新领取
+            conn.execute(
+                """UPDATE tasks
+                   SET state = 'pending', lease_token = NULL, lease_expires_at = NULL,
+                       worker_id = NULL, finished_at = NULL, next_eligible_at = NULL,
+                       blocked_reason = NULL
+                   WHERE id = ?""",
+                (task_id,),
+            )
+            # task.resumed 与状态变更同事务
+            _append_event(
+                conn,
+                EVT_TASK_RESUMED,
+                row["dag_id"],
+                now_iso,
+                task_id=task_id,
+                attempt=row["attempt"],
+                from_state=FAILED,
+                to_state=PENDING,
+            )
+            unblocked = _unblock_descendants(conn, row["dag_id"], row["task_key"], now_iso)
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+
+    return {
+        "task_id": task_id,
+        "state": PENDING,
+        "attempt": row["attempt"],
+        "failure_count": row["failure_count"],
+        "unblocked_descendants": unblocked,
+    }
 
 
 # ---------------------------------------------------------------- 状态查询
