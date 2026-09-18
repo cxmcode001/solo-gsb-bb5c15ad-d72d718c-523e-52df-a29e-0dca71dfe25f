@@ -97,3 +97,16 @@ def complete_task(task_id: str, body: CompleteIn):
             media_type="application/json",
         )
     return result
+
+
+@app.post(
+    "/tasks/{task_id}/resume",
+    summary="恢复最终失败的任务",
+    responses={
+        200: {"description": "已恢复为 pending；前置条件满足的被阻塞后继已在同事务内连锁解锁"},
+        404: {"description": "任务不存在（task_not_found）"},
+        409: {"description": "任务不是最终失败状态（task_not_failed）；重复恢复同样返回 409 且不新增事件"},
+    },
+)
+def resume_task(task_id: str) -> dict:
+    return service.resume_task(task_id)

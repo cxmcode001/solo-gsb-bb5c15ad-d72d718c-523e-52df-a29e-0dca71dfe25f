@@ -1713,3 +1713,248 @@ def test_legacy_sqlite_db_gets_duration_default(tmp_path, monkeypatch):
     assert analysis["total_duration_seconds"] == 1 + 1  # 历史任务默认时长 1
     assert analysis["critical_path"] == ["a", "b"]
     assert analysis["levels"] == [["a"], ["b"]]
+
+
+# ------------------------------------------------------------- 失败恢复
+
+def _fail(client, task, cid):
+    """显式失败（重试耗尽 -> failed）并断言进入最终失败状态。"""
+    r = client.post(
+        f"/tasks/{task['task_id']}/complete",
+        json={"completion_id": cid, "lease_token": task["lease_token"],
+              "success": False, "error": "fatal"},
+    )
+    assert r.status_code == 200 and r.json()["state"] == "failed"
+    return r
+
+
+def test_resume_failed_task_restores_pending_and_emits_event(client):
+    submit(client, [{"key": "a", "max_retries": 0}], dag_id="rs-1")
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    _fail(client, t, "f1")
+    detail = client.get(f"/tasks/{t['task_id']}").json()
+    assert detail["state"] == "failed" and detail["finished_at"] is not None
+
+    r = client.post(f"/tasks/{t['task_id']}/resume")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["task_id"] == t["task_id"]
+    assert body["state"] == "pending"
+    assert body["attempt"] == 1
+    assert body["unblocked_descendants"] == 0
+
+    # 租约与完成时间已清除；失败计数与重试预算不重置
+    detail = client.get(f"/tasks/{t['task_id']}").json()
+    assert detail["state"] == "pending"
+    assert detail["lease"] is None
+    assert detail["finished_at"] is None
+    assert detail["failure_count"] == 1
+    assert detail["retries_remaining"] == 0
+
+    # task.resumed 事件：failed -> pending
+    events = client.get("/events", params={"dag_id": "rs-1"}).json()["events"]
+    assert events[-1]["type"] == "task.resumed"
+    assert events[-1]["task_id"] == t["task_id"]
+    assert events[-1]["from_state"] == "failed"
+    assert events[-1]["to_state"] == "pending"
+
+    # 恢复后立即可被重新领取；再次显式失败因预算耗尽直接回到 failed
+    t2 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert t2["task_id"] == t["task_id"] and t2["attempt"] == 2
+    _fail(client, t2, "f2")
+    assert client.get(f"/tasks/{t['task_id']}").json()["state"] == "failed"
+
+
+def test_resume_recursively_unblocks_descendants(client):
+    submit(
+        client,
+        [
+            {"key": "a", "max_retries": 0},
+            {"key": "b", "deps": ["a"]},
+            {"key": "c", "deps": ["b"]},
+            {"key": "d", "deps": ["a"]},
+        ],
+        dag_id="rs-2",
+    )
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    r = _fail(client, t, "f1")
+    assert r.json()["blocked_descendants"] == 3
+
+    r = client.post(f"/tasks/{t['task_id']}/resume")
+    assert r.status_code == 200 and r.json()["unblocked_descendants"] == 3
+
+    full = client.get("/dags/rs-2").json()
+    assert full["states"]["pending"] == 4
+    for key in ("b", "c", "d"):
+        task = by_key(full, key)
+        assert task["state"] == "pending" and task["blocked_reason"] is None
+
+    # 事件因果顺序：根 failed->pending 在前，后继 blocked->pending 连锁在后
+    events = [e for e in client.get("/events", params={"dag_id": "rs-2"}).json()["events"]
+              if e["type"] == "task.resumed"]
+    assert len(events) == 4
+    assert events[0]["task_id"] == t["task_id"]
+    assert events[0]["from_state"] == "failed" and events[0]["to_state"] == "pending"
+    assert all(e["from_state"] == "blocked" and e["to_state"] == "pending"
+               for e in events[1:])
+
+    # 解锁后的链路可正常执行到成功
+    for _ in range(4):
+        claimed = client.post("/tasks/claim", json={"dag_id": "rs-2", "limit": 10}).json()["claimed"]
+        for task in claimed:
+            client.post(
+                f"/tasks/{task['task_id']}/complete",
+                json={"completion_id": f"ok-{task['task_key']}",
+                      "lease_token": task["lease_token"], "success": True},
+            )
+    assert client.get("/dags/rs-2").json()["states"]["succeeded"] == 4
+
+
+def test_resume_keeps_blocked_while_other_upstream_failed(client):
+    submit(
+        client,
+        [
+            {"key": "a", "max_retries": 0},
+            {"key": "b", "max_retries": 0},
+            {"key": "c", "deps": ["a", "b"]},
+        ],
+        dag_id="rs-3",
+    )
+    claimed = client.post("/tasks/claim", json={"dag_id": "rs-3", "limit": 10}).json()["claimed"]
+    by = {t["task_key"]: t for t in claimed}
+    _fail(client, by["a"], "fa")
+    _fail(client, by["b"], "fb")
+
+    c = by_key(client.get("/dags/rs-3").json(), "c")
+    assert c["state"] == "blocked"
+    reason = c["blocked_reason"]
+    assert "permanently failed" in reason
+
+    # 只恢复 a：c 的另一前置 b 仍 failed -> 保持 blocked 与原阻塞原因
+    r = client.post(f"/tasks/{by['a']['task_id']}/resume")
+    assert r.status_code == 200 and r.json()["unblocked_descendants"] == 0
+    c = by_key(client.get("/dags/rs-3").json(), "c")
+    assert c["state"] == "blocked" and c["blocked_reason"] == reason
+
+    # 再恢复 b：c 的全部前置均处于 pending -> 解锁
+    r = client.post(f"/tasks/{by['b']['task_id']}/resume")
+    assert r.status_code == 200 and r.json()["unblocked_descendants"] == 1
+    c = by_key(client.get("/dags/rs-3").json(), "c")
+    assert c["state"] == "pending" and c["blocked_reason"] is None
+
+
+def test_resume_unblocks_when_other_upstream_is_plain_pending(client):
+    # c 的另一前置 b 是健康的普通 pending（尚未运行）：恢复 a 后 c 不再有任何
+    # 失败/阻塞/运行中的前置，随本次恢复解锁为 pending，等待 b 正常完成即可被领取
+    submit(
+        client,
+        [
+            {"key": "a", "max_retries": 0},
+            {"key": "b"},
+            {"key": "c", "deps": ["a", "b"]},
+        ],
+        dag_id="rs-4",
+    )
+    t = client.post("/tasks/claim", json={"dag_id": "rs-4"}).json()["claimed"][0]
+    assert t["task_key"] == "a"  # 按创建序先领到 a
+    _fail(client, t, "fa")
+    assert by_key(client.get("/dags/rs-4").json(), "c")["state"] == "blocked"
+
+    r = client.post(f"/tasks/{t['task_id']}/resume")
+    assert r.status_code == 200 and r.json()["unblocked_descendants"] == 1
+    full = client.get("/dags/rs-4").json()
+    assert by_key(full, "c")["state"] == "pending"
+    assert by_key(full, "b")["state"] == "pending"
+
+    # 依赖门控仍然生效：a、b 成功前 c 不可领取
+    claimed = client.post("/tasks/claim", json={"dag_id": "rs-4", "limit": 10}).json()["claimed"]
+    assert {t["task_key"] for t in claimed} == {"a", "b"}
+
+
+def test_resume_keeps_blocked_while_other_upstream_running(client):
+    submit(
+        client,
+        [
+            {"key": "a", "max_retries": 0, "lease_seconds": 30},
+            {"key": "b", "lease_seconds": 30},
+            {"key": "c", "deps": ["a", "b"]},
+        ],
+        dag_id="rs-5",
+    )
+    claimed = client.post("/tasks/claim", json={"dag_id": "rs-5", "limit": 10}).json()["claimed"]
+    by = {t["task_key"]: t for t in claimed}
+    # a 最终失败（c 被阻塞）时 b 仍在运行（租约有效）
+    _fail(client, by["a"], "fa")
+    c = by_key(client.get("/dags/rs-5").json(), "c")
+    assert c["state"] == "blocked"
+    reason = c["blocked_reason"]
+
+    # b 处于 running：不满足 succeeded/pending -> c 保持 blocked 与原阻塞原因
+    r = client.post(f"/tasks/{by['a']['task_id']}/resume")
+    assert r.status_code == 200 and r.json()["unblocked_descendants"] == 0
+    c = by_key(client.get("/dags/rs-5").json(), "c")
+    assert c["state"] == "blocked" and c["blocked_reason"] == reason
+
+
+def test_resume_rejects_non_failed_and_unknown_tasks(client):
+    submit(client, [{"key": "a"}, {"key": "b", "deps": ["a"]}], dag_id="rs-6")
+
+    # 未知任务 -> 404
+    r = client.post("/tasks/nonexistent/resume")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "task_not_found"
+
+    # pending -> 409
+    a = by_key(client.get("/dags/rs-6").json(), "a")
+    r = client.post(f"/tasks/{a['id']}/resume")
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "task_not_failed"
+    assert r.json()["error"]["details"]["state"] == "pending"
+
+    # running -> 409
+    t = client.post("/tasks/claim", json={"dag_id": "rs-6"}).json()["claimed"][0]
+    assert client.post(f"/tasks/{t['task_id']}/resume").status_code == 409
+
+    # succeeded -> 409
+    client.post(f"/tasks/{t['task_id']}/complete",
+                json={"completion_id": "ok", "lease_token": t["lease_token"], "success": True})
+    r = client.post(f"/tasks/{t['task_id']}/resume")
+    assert r.status_code == 409
+    assert r.json()["error"]["details"]["state"] == "succeeded"
+
+    # blocked -> 409（blocked 不是最终失败，须恢复其失败上游）
+    submit(client, [{"key": "x", "max_retries": 0}, {"key": "y", "deps": ["x"]}], dag_id="rs-7")
+    tx = client.post("/tasks/claim", json={"dag_id": "rs-7"}).json()["claimed"][0]
+    _fail(client, tx, "fx")
+    y = by_key(client.get("/dags/rs-7").json(), "y")
+    assert y["state"] == "blocked"
+    r = client.post(f"/tasks/{y['id']}/resume")
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "task_not_failed"
+
+
+def test_resume_twice_returns_409_and_adds_no_event(client):
+    submit(client, [{"key": "a", "max_retries": 0}, {"key": "b", "deps": ["a"]}], dag_id="rs-8")
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    _fail(client, t, "f1")
+
+    r = client.post(f"/tasks/{t['task_id']}/resume")
+    assert r.status_code == 200 and r.json()["unblocked_descendants"] == 1
+    events = client.get("/events", params={"dag_id": "rs-8"}).json()["events"]
+    assert [e["type"] for e in events[-2:]] == ["task.resumed", "task.resumed"]
+    n_events = len(events)
+
+    # 重复恢复：任务已回到 pending -> 409，且不新增任何事件
+    r = client.post(f"/tasks/{t['task_id']}/resume")
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "task_not_failed"
+    events_after = client.get("/events", params={"dag_id": "rs-8"}).json()["events"]
+    assert len(events_after) == n_events
+
+
+def test_openapi_documents_resume_endpoint(client):
+    spec = client.get("/openapi.json").json()
+    path = spec["paths"]["/tasks/{task_id}/resume"]["post"]
+    assert "200" in path["responses"]
+    assert "404" in path["responses"]
+    assert "409" in path["responses"]
